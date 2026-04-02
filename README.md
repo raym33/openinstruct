@@ -32,6 +32,7 @@ Ahora también incluye una base de IDE local sobre `Code - OSS` / `VS Code`:
 - Sesiones persistentes en `~/.openinstruct/sessions`.
 - Backends de memoria a largo plazo con `mem0` o `sqlite`.
 - Daemon local `openinstructd` para integraciones IDE o TUI.
+- UI web móvil servida desde el propio daemon.
 - Extensión `Code - OSS` / `VS Code` con panel de chat y árbol de sesiones.
 - Launcher portable para montar un mini IDE local en macOS.
 - Modo `knowledge base` para compilar `raw/` en una wiki markdown y derivar respuestas, slides y figuras.
@@ -60,6 +61,7 @@ openinstruct chat
 openinstruct run "analiza este repo y propón mejoras"
 openinstruct doctor
 openinstruct daemon --port 8765
+openinstruct mobile publish --provider ollama --model qwen2.5-coder:14b
 openinstruct kb init
 ```
 
@@ -150,6 +152,12 @@ Estado del workspace:
 openinstruct kb status
 ```
 
+Actualizar el manifiesto incremental de fuentes:
+
+```bash
+openinstruct kb ingest
+```
+
 Compilar `raw/` hacia la wiki:
 
 ```bash
@@ -185,6 +193,13 @@ Layout generado:
 - `outputs/slides/`
 - `outputs/figures/`
 - `.openinstruct/kb.json`
+- `.openinstruct/sources.json`
+
+Flujo incremental recomendado:
+
+1. Añade o actualiza documentos en `raw/`.
+2. Ejecuta `openinstruct kb ingest` para recalcular hashes y detectar `added/modified/removed`.
+3. Ejecuta `openinstruct kb compile` para que el agente priorice solo las fuentes nuevas o cambiadas.
 
 ## Slash Commands
 
@@ -205,6 +220,7 @@ Dentro del REPL:
 - `/delegate arregla el flujo de login y añade tests`
 - `/session-spawn revisa auth y prepara hallazgos`
 - `/session-send sess_... continúa con tests`
+- `/session-visibility <self|tree|all>`
 - `/session-status sess_...`
 - `/session-history sess_...`
 - `/background revisa la arquitectura y prepara un resumen`
@@ -213,6 +229,7 @@ Dentro del REPL:
 - `/locks`
 - `/merge`
 - `/checkpoints`
+- `/resume-checkpoint <run_id>`
 - `/history 8`
 - `/compact 8`
 - `/init`
@@ -221,6 +238,7 @@ Dentro del REPL:
 - `/memory-policy <none|selective|all>`
 - `/kb-init [name]`
 - `/kb-status`
+- `/kb-ingest`
 - `/kb-compile [scope]`
 - `/kb-ask <question>`
 - `/kb-slide <question>`
@@ -286,6 +304,7 @@ openinstructd --provider ollama --model qwen2.5-coder:14b --workdir /ruta/al/pro
 
 Endpoints principales:
 
+- `GET /`
 - `GET /health`
 - `GET /api/state`
 - `GET /api/jobs`
@@ -296,6 +315,8 @@ Endpoints principales:
 - `GET /api/sessions/<session_id>`
 - `POST /api/sessions`
 - `POST /api/sessions/<session_id>/messages`
+
+`GET /` sirve una UI web móvil responsive para lanzar prompts, slash commands y seguir jobs/sesiones desde Safari.
 
 `POST /api/jobs` acepta:
 
@@ -314,6 +335,56 @@ o:
   "input": "/delegate arregla login y añade tests"
 }
 ```
+
+`POST /api/sessions` también acepta:
+
+```json
+{
+  "prompt": "revisa auth",
+  "write": false,
+  "visibility": "tree"
+}
+```
+
+Scopes de visibilidad por sesión:
+
+- `self`: la sesión solo puede verse a sí misma.
+- `tree`: la sesión puede ver su propia rama de descendientes.
+- `all`: la sesión puede ver y controlar cualquier sesión gestionada.
+
+El runtime principal usa `all` por defecto. Las sesiones nuevas nacen con `tree` salvo que indiques otro valor.
+
+## Mobile / Tailscale
+
+Para usar el daemon desde un iPhone:
+
+```bash
+openinstruct mobile publish \
+  --provider ollama \
+  --model qwen2.5-coder:14b \
+  --workdir /ruta/al/proyecto
+```
+
+Ese comando:
+
+1. arranca `openinstructd` en `127.0.0.1:<port>` si todavía no está levantado
+2. publica la UI móvil con `tailscale serve`
+3. guarda metadata y logs en `~/.openinstruct/mobile-ui/`
+
+Flags útiles:
+
+- `--https-port 443`
+- `--path /mobile`
+- `--no-start-daemon`
+- `--reset`
+- `--tailscale-command tailscale`
+- `--daemon-command openinstructd`
+
+Notas:
+
+- necesita `tailscale` instalado y autenticado en el Mac
+- el proxy de `tailscale serve` apunta a `http://127.0.0.1:<port>`
+- aquí no pude probar una publicación real porque `tailscale` no estaba instalado en el sandbox
 
 ## Extensión Code - OSS / VS Code
 
@@ -502,6 +573,7 @@ Cada ejecución de `/parallel` o `/delegate` ahora guarda checkpoints en `~/.ope
 - reintenta tareas fallidas hasta `task_retries`
 - marca `blocked` cuando una tarea no puede ejecutarse porque una dependencia falló definitivamente
 - deja el último run accesible desde el REPL
+- permite reanudar un run y relanzar solo tareas `failed` o `blocked`, reutilizando las `success`
 
 Comandos útiles:
 
@@ -509,12 +581,19 @@ Comandos útiles:
 /retries 2
 /delegate arregla login y añade tests
 /checkpoints
+/resume-checkpoint session-actual-dag-20260402-101530
 ```
 
 También puedes inspeccionar un run concreto:
 
 ```text
 /checkpoints session-actual-dag-20260402-101530
+```
+
+O reanudarlo desde CLI:
+
+```bash
+openinstruct resume-checkpoint --provider ollama --model qwen2.5-coder:14b session-actual-dag-20260402-101530
 ```
 
 ## Locks de Escritura

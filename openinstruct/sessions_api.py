@@ -27,6 +27,7 @@ class ManagedSessionsAPI:
         write: bool = False,
         title: str = "",
         prefix: str = "sess",
+        visibility: str = "tree",
     ) -> Dict[str, Any]:
         if write and self.runtime.settings.approval_policy != "auto":
             raise ValueError("Managed sessions may mutate the workspace only when approval policy is 'auto'.")
@@ -37,6 +38,7 @@ class ManagedSessionsAPI:
             prefix=prefix,
             title=title or None,
             approval_policy=approval_policy,
+            visibility=visibility,
         )
         return self.status(session.session_id)
 

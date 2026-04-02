@@ -327,6 +327,56 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("report back", history.output)
         self.assertIn(session_id, listing.output)
 
+    def test_tree_visibility_limits_managed_session_access(self) -> None:
+        root = TestRuntime(
+            settings=self.settings,
+            provider_info=ProviderInfo(name="ollama", base_url="http://127.0.0.1:11434", model="dummy-model"),
+            provider=DummyProvider(),
+        )
+        parent = root.spawn_managed_session("inspect auth flow", session_id="sess_parent", visibility="tree")
+        root.wait_for_managed_session(parent.session_id, timeout=1.0)
+        outsider = root.spawn_managed_session("inspect billing flow", session_id="sess_outsider", visibility="tree")
+        root.wait_for_managed_session(outsider.session_id, timeout=1.0)
+
+        child_runtime = parent.runtime
+        self.assertIsNotNone(child_runtime)
+        descendant = child_runtime.spawn_managed_session("inspect auth tests", session_id="sess_child", visibility="tree")  # type: ignore[union-attr]
+        root.wait_for_managed_session(descendant.session_id, timeout=1.0)
+
+        listing = child_runtime.run_action("sessions_list", {})  # type: ignore[union-attr]
+        denied = child_runtime.run_action("sessions_status", {"session_id": outsider.session_id})  # type: ignore[union-attr]
+        allowed = child_runtime.run_action("sessions_status", {"session_id": descendant.session_id})  # type: ignore[union-attr]
+
+        self.assertTrue(listing.ok)
+        visible_ids = [item["session_id"] for item in listing.metadata["sessions"]]
+        self.assertIn(parent.session_id, visible_ids)
+        self.assertIn(descendant.session_id, visible_ids)
+        self.assertNotIn(outsider.session_id, visible_ids)
+        self.assertFalse(denied.ok)
+        self.assertIn("not visible", denied.output)
+        self.assertTrue(allowed.ok)
+        self.assertEqual(allowed.metadata["visibility"], "tree")
+
+    def test_self_visibility_only_exposes_current_session(self) -> None:
+        root = TestRuntime(
+            settings=self.settings,
+            provider_info=ProviderInfo(name="ollama", base_url="http://127.0.0.1:11434", model="dummy-model"),
+            provider=DummyProvider(),
+        )
+        session = root.spawn_managed_session("inspect auth flow", session_id="sess_self", visibility="self")
+        root.wait_for_managed_session(session.session_id, timeout=1.0)
+        sibling = root.spawn_managed_session("inspect docs", session_id="sess_sibling", visibility="tree")
+        root.wait_for_managed_session(sibling.session_id, timeout=1.0)
+
+        child_runtime = session.runtime
+        self.assertIsNotNone(child_runtime)
+        listing = child_runtime.run_action("sessions_list", {})  # type: ignore[union-attr]
+        self.assertTrue(listing.ok)
+        self.assertEqual([item["session_id"] for item in listing.metadata["sessions"]], [session.session_id])
+        denied = child_runtime.run_action("sessions_send", {"session_id": sibling.session_id, "prompt": "hello"})  # type: ignore[union-attr]
+        self.assertFalse(denied.ok)
+        self.assertIn("not visible", denied.output)
+
     def test_orchestrate_goal_executes_planned_tasks(self) -> None:
         runtime = PlanningRuntime(
             settings=self.settings,
@@ -457,6 +507,76 @@ class AgentRuntimeTests(unittest.TestCase):
         checkpoints = result.metadata["checkpoints"]
         self.assertEqual(checkpoints[0]["status"], "failed")
         self.assertEqual(checkpoints[1]["status"], "blocked")
+
+    def test_resume_checkpoint_reruns_only_failed_or_blocked_tasks(self) -> None:
+        retry_settings = Settings(
+            provider="ollama",
+            model="dummy-model",
+            workdir=self.root,
+            approval_policy="auto",
+            max_steps=4,
+            max_agents=2,
+            task_retries=0,
+            temperature=0.2,
+            home=self.root / ".home",
+        )
+        runtime = FlakyRuntime(
+            settings=retry_settings,
+            provider_info=ProviderInfo(name="ollama", base_url="http://127.0.0.1:11434", model="dummy-model"),
+            provider=DummyProvider(),
+            failure_plan={"scan": 1},
+        )
+        first = runtime.run_parallel_tasks(
+            tasks=[
+                {"name": "scan", "prompt": "Inspect auth flow"},
+                {"name": "fix", "prompt": "Apply fix", "depends_on": ["scan"]},
+            ],
+            allow_mutations=False,
+            max_agents=2,
+        )
+        self.assertFalse(first.ok)
+        first_run_id = first.metadata["checkpoint_run_id"]
+        resumed = runtime.resume_from_checkpoint(first_run_id, max_agents=2)
+        self.assertTrue(resumed.ok)
+        self.assertEqual(resumed.tool, "spawn_agents")
+        self.assertEqual(runtime.attempts["scan"], 2)
+        self.assertIn("Resumed from checkpoint", resumed.output)
+        self.assertEqual(resumed.metadata["resumed_from_run_id"], first_run_id)
+
+    def test_resume_checkpoint_reuses_successful_tasks(self) -> None:
+        retry_settings = Settings(
+            provider="ollama",
+            model="dummy-model",
+            workdir=self.root,
+            approval_policy="auto",
+            max_steps=4,
+            max_agents=2,
+            task_retries=0,
+            temperature=0.2,
+            home=self.root / ".home",
+        )
+        runtime = FlakyRuntime(
+            settings=retry_settings,
+            provider_info=ProviderInfo(name="ollama", base_url="http://127.0.0.1:11434", model="dummy-model"),
+            provider=DummyProvider(),
+            failure_plan={"fix": 1},
+        )
+        first = runtime.run_parallel_tasks(
+            tasks=[
+                {"name": "scan", "prompt": "Inspect auth flow"},
+                {"name": "fix", "prompt": "Apply fix"},
+            ],
+            allow_mutations=False,
+            max_agents=2,
+        )
+        self.assertFalse(first.ok)
+        self.assertEqual(runtime.attempts["scan"], 1)
+        resumed = runtime.resume_from_checkpoint(first.metadata["checkpoint_run_id"], max_agents=2)
+        self.assertTrue(resumed.ok)
+        self.assertEqual(runtime.attempts["scan"], 1)
+        self.assertEqual(runtime.attempts["fix"], 2)
+        self.assertIn("Reused tasks: scan", resumed.output)
+        self.assertIn("scan", resumed.metadata["reused_tasks"])
 
     def test_parallel_mutations_include_merge_report(self) -> None:
         runtime = MutationRuntime(

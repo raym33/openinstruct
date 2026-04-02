@@ -3,9 +3,12 @@ import unittest
 from pathlib import Path
 
 from openinstruct.knowledge import (
+    build_compile_prompt,
     default_query_output_path,
+    ingest_sources,
     init_knowledge_base,
     knowledge_status,
+    knowledge_paths,
 )
 
 
@@ -51,6 +54,34 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(marp_path.parent, self.root / "outputs" / "slides")
         self.assertEqual(markdown_path.suffix, ".md")
         self.assertEqual(marp_path.suffix, ".md")
+
+    def test_ingest_sources_tracks_added_modified_and_removed_files(self) -> None:
+        init_knowledge_base(self.root)
+        source = self.root / "raw" / "paper.md"
+        source.write_text("# first\n", encoding="utf-8")
+        first = ingest_sources(self.root)
+        self.assertEqual(first["summary"]["added"], 1)
+        self.assertEqual(first["sources"]["paper.md"]["status"], "added")
+        self.assertTrue(knowledge_paths(self.root).manifest_path.exists())
+
+        source.write_text("# second\n", encoding="utf-8")
+        second = ingest_sources(self.root)
+        self.assertEqual(second["summary"]["modified"], 1)
+        self.assertEqual(second["sources"]["paper.md"]["status"], "modified")
+
+        source.unlink()
+        third = ingest_sources(self.root)
+        self.assertEqual(third["summary"]["removed"], 1)
+        self.assertEqual(third["sources"]["paper.md"]["status"], "removed")
+
+    def test_compile_prompt_includes_manifest_delta(self) -> None:
+        init_knowledge_base(self.root)
+        (self.root / "raw" / "notes.txt").write_text("notes\n", encoding="utf-8")
+        ingest_sources(self.root)
+        prompt = build_compile_prompt(self.root, scope="focus on new notes")
+        self.assertIn("Manifest:", prompt)
+        self.assertIn("notes.txt", prompt)
+        self.assertIn("focus on new notes", prompt)
 
 
 if __name__ == "__main__":

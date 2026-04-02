@@ -14,6 +14,7 @@ from .agent import AgentRuntime, TerminalUI
 from .config import Settings, load_settings
 from .memory import MemoryBackendError, build_memory_backend
 from .providers import ProviderError, instantiate_provider, select_provider
+from .webui import render_mobile_ui
 
 
 @dataclass
@@ -186,8 +187,14 @@ class OpenInstructDaemon:
     def session_payload(self, session_id: str, limit: int = 8) -> Dict[str, Any]:
         return self.runtime.sessions_api.history(session_id, limit=limit)
 
-    def spawn_session(self, prompt: str, session_id: str = "", write: bool = False) -> Dict[str, Any]:
-        return self.runtime.sessions_api.spawn(prompt, session_id=session_id, write=write)
+    def spawn_session(
+        self,
+        prompt: str,
+        session_id: str = "",
+        write: bool = False,
+        visibility: str = "tree",
+    ) -> Dict[str, Any]:
+        return self.runtime.sessions_api.spawn(prompt, session_id=session_id, write=write, visibility=visibility)
 
     def send_session_input(self, session_id: str, prompt: str) -> Dict[str, Any]:
         return self.runtime.sessions_api.send(session_id, prompt)
@@ -214,8 +221,18 @@ class OpenInstructRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_text(self, status: int, body: str, content_type: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _read_json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -231,6 +248,9 @@ class OpenInstructRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
+            if path == "/":
+                self._send_text(HTTPStatus.OK, render_mobile_ui(self.daemon_runtime.state_payload()), "text/html")
+                return
             if path == "/health":
                 self._send_json(HTTPStatus.OK, {"ok": True, "service": "openinstructd"})
                 return
@@ -282,7 +302,16 @@ class OpenInstructRequestHandler(BaseHTTPRequestHandler):
                 prompt = str(payload.get("prompt") or "").strip()
                 session_id = str(payload.get("session_id") or "").strip()
                 write = bool(payload.get("write", False))
-                self._send_json(HTTPStatus.ACCEPTED, self.daemon_runtime.spawn_session(prompt, session_id=session_id, write=write))
+                visibility = str(payload.get("visibility") or "tree").strip() or "tree"
+                self._send_json(
+                    HTTPStatus.ACCEPTED,
+                    self.daemon_runtime.spawn_session(
+                        prompt,
+                        session_id=session_id,
+                        write=write,
+                        visibility=visibility,
+                    ),
+                )
                 return
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 session_id = path.split("/", 4)[-2]

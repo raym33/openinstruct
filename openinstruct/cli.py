@@ -8,8 +8,9 @@ from typing import Dict, Optional
 from .agent import AgentRuntime
 from .config import Settings, config_path, init_config, load_settings
 from .daemon import command_daemon
-from .knowledge import init_knowledge_base, render_knowledge_status
+from .knowledge import ingest_sources, init_knowledge_base, render_ingest_summary, render_knowledge_status
 from .memory import MemoryBackendError, build_memory_backend
+from .mobile import command_mobile_publish
 from .providers import ProviderError, ProviderInfo, available_providers, instantiate_provider, select_provider
 from .session import SessionStore
 
@@ -37,12 +38,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", parents=[common_parent], help="ejecuta una tarea one-shot")
     run_parser.add_argument("task", nargs="+")
+    resume_parser = subparsers.add_parser("resume-checkpoint", parents=[common_parent], help="reanuda un DAG desde un checkpoint")
+    resume_parser.add_argument("run_id")
 
     subparsers.add_parser("doctor", parents=[common_parent], help="verifica proveedores y modelos")
     subparsers.add_parser("sessions", parents=[common_parent], help="lista sesiones guardadas")
     daemon_parser = subparsers.add_parser("daemon", parents=[common_parent], help="expone openinstructd por HTTP")
     daemon_parser.add_argument("--host", default="127.0.0.1")
     daemon_parser.add_argument("--port", default=8765, type=int)
+    mobile_parser = subparsers.add_parser("mobile", help="utilidades para publicar la UI movil")
+    mobile_subparsers = mobile_parser.add_subparsers(dest="mobile_command")
+    mobile_publish = mobile_subparsers.add_parser(
+        "publish",
+        parents=[common_parent],
+        help="arranca openinstructd y lo expone por tailscale serve",
+    )
+    mobile_publish.add_argument("--port", default=8765, type=int)
+    mobile_publish.add_argument("--https-port", default=443, type=int)
+    mobile_publish.add_argument("--path", default="/")
+    mobile_publish.add_argument("--daemon-command", default="openinstructd")
+    mobile_publish.add_argument("--tailscale-command", default="tailscale")
+    mobile_publish.add_argument("--no-start-daemon", action="store_true")
+    mobile_publish.add_argument("--reset", action="store_true")
 
     kb_parser = subparsers.add_parser("kb", help="operaciones de knowledge base sobre raw/wiki/outputs")
     kb_subparsers = kb_parser.add_subparsers(dest="kb_command")
@@ -50,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     kb_init.add_argument("--name", default="")
     kb_init.add_argument("--workdir", default=None)
     kb_subparsers.add_parser("status", parents=[common_parent], help="muestra el estado de la knowledge base")
+    kb_subparsers.add_parser("ingest", parents=[common_parent], help="actualiza el manifiesto incremental de raw/")
     kb_compile = kb_subparsers.add_parser("compile", parents=[common_parent], help="compila raw/ en wiki/")
     kb_compile.add_argument("scope", nargs="*")
     kb_ask = kb_subparsers.add_parser("ask", parents=[common_parent], help="responde una pregunta y la archiva en markdown")
@@ -185,6 +203,7 @@ def command_kb(args: argparse.Namespace) -> int:
             "knowledge base initialized\n"
             f"root={payload['root']}\n"
             f"config={payload['config_path']}\n"
+            f"manifest={payload['manifest_path']}\n"
             f"raw={payload['raw_dir']}\n"
             f"wiki={payload['wiki_dir']}\n"
             f"outputs={payload['outputs_dir']}"
@@ -194,6 +213,10 @@ def command_kb(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     if kb_command == "status":
         print(render_knowledge_status(settings.workdir))
+        return 0
+    if kb_command == "ingest":
+        payload = ingest_sources(settings.workdir)
+        print(render_ingest_summary(settings.workdir, payload))
         return 0
     runtime = _build_runtime(settings)
     if kb_command == "compile":
@@ -211,7 +234,23 @@ def command_kb(args: argparse.Namespace) -> int:
     if kb_command == "lint":
         print(runtime.run_knowledge_lint(fix=bool(args.fix)))
         return 0
-    raise SystemExit("Use one of: init, status, compile, ask, lint")
+    raise SystemExit("Use one of: init, status, ingest, compile, ask, lint")
+
+
+def command_mobile(args: argparse.Namespace) -> int:
+    if args.mobile_command != "publish":
+        raise SystemExit("Use: openinstruct mobile publish")
+    settings = _settings_from_args(args)
+    return command_mobile_publish(
+        settings,
+        port=args.port,
+        https_port=args.https_port,
+        path=args.path,
+        daemon_command=args.daemon_command,
+        tailscale_command=args.tailscale_command,
+        no_start_daemon=bool(args.no_start_daemon),
+        reset=bool(args.reset),
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -223,6 +262,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return command_config(args)
     if command == "kb":
         return command_kb(args)
+    if command == "mobile":
+        return command_mobile(args)
 
     settings = _settings_from_args(args)
 
@@ -238,6 +279,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = runtime.run_task(" ".join(args.task))
             print(result)
             return 0
+        if command == "resume-checkpoint":
+            runtime = _build_runtime(settings)
+            result = runtime.resume_from_checkpoint(args.run_id, max_agents=settings.max_agents)
+            print(result.output)
+            return 0 if result.ok else 1
         if command == "chat":
             runtime = _build_runtime(settings)
             return runtime.repl()

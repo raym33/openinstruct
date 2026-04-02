@@ -1,12 +1,14 @@
 import json
+import http.client
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from threading import Thread
 
 from openinstruct.agent import AgentRuntime
 from openinstruct.config import Settings
-from openinstruct.daemon import OpenInstructDaemon
+from openinstruct.daemon import DaemonHTTPServer, OpenInstructDaemon, OpenInstructRequestHandler
 from openinstruct.providers import ProviderInfo
 
 
@@ -45,6 +47,12 @@ class DaemonTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def start_http_server(self):
+        server = DaemonHTTPServer(("127.0.0.1", 0), OpenInstructRequestHandler, self.daemon)
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        return server, worker
 
     def wait_for_job(self, job_id: str, timeout: float = 3.0):
         deadline = time.time() + timeout
@@ -90,6 +98,39 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("queue_depth", status)
         self.assertEqual(history["session_id"], session_id)
         self.assertTrue(history["queued_work"])
+
+    def test_root_route_serves_mobile_html(self) -> None:
+        server, worker = self.start_http_server()
+        try:
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=3.0)
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/html", response.getheader("Content-Type", ""))
+            self.assertIn("OpenInstruct Mobile", body)
+            self.assertIn("/api/jobs", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2.0)
+
+    def test_http_sessions_spawn_accepts_visibility(self) -> None:
+        server, worker = self.start_http_server()
+        try:
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=3.0)
+            payload = json.dumps({"prompt": "review auth layer", "visibility": "self"})
+            connection.request("POST", "/api/sessions", body=payload, headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 202)
+            self.assertEqual(body["visibility"], "self")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2.0)
 
 
 if __name__ == "__main__":

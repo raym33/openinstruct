@@ -20,7 +20,9 @@ from .knowledge import (
     build_lint_prompt,
     build_question_prompt,
     default_query_output_path,
+    ingest_sources,
     init_knowledge_base,
+    render_ingest_summary,
     render_knowledge_status,
 )
 from .locking import WorkspaceLockManager
@@ -35,6 +37,7 @@ from .worktree import GitWorktree, WorktreeError, create_isolated_worktree, dete
 Message = Dict[str, str]
 MAX_MERGE_PREVIEW_CHARS = 4000
 MAX_MERGE_FILES_PER_TASK = 6
+SESSION_VISIBILITIES = {"self", "tree", "all"}
 
 
 class TerminalUI:
@@ -117,6 +120,7 @@ class ManagedSession:
     session_id: str
     title: str
     parent_id: str = ""
+    visibility: str = "tree"
     status: str = "idle"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -139,6 +143,7 @@ class AgentRuntime:
         lock_manager: Optional[WorkspaceLockManager] = None,
         agent_label: str = "primary",
         managed_session_id: str = "",
+        session_visibility: str = "all",
         memory_backend: Optional[BaseMemoryBackend] = None,
     ):
         self.ui = ui or TerminalUI()
@@ -152,6 +157,7 @@ class AgentRuntime:
         self.lock_manager = lock_manager or WorkspaceLockManager()
         self.agent_label = agent_label
         self.managed_session_id = managed_session_id
+        self.session_visibility = self._normalize_session_visibility(session_visibility)
         self.managed_sessions: Dict[str, ManagedSession] = {}
         self.sessions_api = ManagedSessionsAPI(self)
         self.background_lock = Lock()
@@ -202,6 +208,7 @@ class AgentRuntime:
         approval_policy: Optional[str] = None,
         agent_label: Optional[str] = None,
         managed_session_id: str = "",
+        session_visibility: Optional[str] = None,
         workdir: Optional[Path] = None,
     ) -> "AgentRuntime":
         child_settings = replace(
@@ -225,6 +232,7 @@ class AgentRuntime:
             lock_manager=self.lock_manager,
             agent_label=agent_label or f"{self.agent_label}-{session_suffix}",
             managed_session_id=managed_session_id,
+            session_visibility=session_visibility or self.session_visibility,
             memory_backend=self.memory_backend,
         )
         child.managed_sessions = self.managed_sessions
@@ -259,6 +267,9 @@ class AgentRuntime:
                 "\n"
                 f'- orchestrate(goal, write=false, max_tasks={self.settings.max_agents}, max_agents={self.settings.max_agents}): '
                 "plan a task graph and execute it with sub-agents while respecting dependencies and write conflicts."
+                "\n"
+                f'- resume_checkpoint(run_id, max_agents={self.settings.max_agents}): '
+                "resume a previous DAG checkpoint and rerun only failed or blocked tasks."
             )
         return manifest
 
@@ -311,6 +322,7 @@ class AgentRuntime:
             f"memory_policy={self.settings.memory_policy} "
             f"workdir={self.tools.root} "
             f"approval={self.settings.approval_policy} "
+            f"session_visibility={self.session_visibility} "
             f"max_agents={self.settings.max_agents} "
             f"task_retries={self.settings.task_retries} "
             f"session={self.session_name}"
@@ -333,6 +345,43 @@ class AgentRuntime:
         self.tools.set_root(workdir)
         self.settings.workdir = workdir
         self._reset_messages()
+
+    def _normalize_session_visibility(self, visibility: str) -> str:
+        clean = str(visibility or "tree").strip().lower()
+        if clean not in SESSION_VISIBILITIES:
+            raise ValueError(f"Invalid session visibility: {visibility}")
+        return clean
+
+    def set_session_visibility(self, visibility: str) -> None:
+        self.session_visibility = self._normalize_session_visibility(visibility)
+
+    def _session_is_descendant_locked(self, session_id: str, ancestor_id: str) -> bool:
+        current = session_id
+        seen = set()
+        while current and current not in seen:
+            if current == ancestor_id:
+                return True
+            seen.add(current)
+            session = self.managed_sessions.get(current)
+            if session is None:
+                return False
+            current = session.parent_id
+        return False
+
+    def _can_access_session_locked(self, session_id: str) -> bool:
+        if not self.managed_session_id:
+            return True
+        if self.session_visibility == "all":
+            return True
+        if self.session_visibility == "self":
+            return session_id == self.managed_session_id
+        return self._session_is_descendant_locked(session_id, self.managed_session_id)
+
+    def _assert_session_access_locked(self, session_id: str) -> None:
+        if not self._can_access_session_locked(session_id):
+            raise ValueError(
+                f"Session not visible to current runtime: {session_id} (visibility={self.session_visibility})"
+            )
 
     def set_approval_policy(self, policy: str) -> None:
         if policy not in {"ask", "auto", "deny"}:
@@ -446,12 +495,35 @@ class AgentRuntime:
         return "(no memories)"
 
     def _checkpoint_summary(self, entries: List[Dict[str, Any]]) -> Dict[str, int]:
-        summary = {"success": 0, "failed": 0, "retrying": 0, "blocked": 0}
+        summary = {"success": 0, "failed": 0, "retrying": 0, "blocked": 0, "reused": 0}
         for entry in entries:
             status = str(entry.get("status") or "")
             if status in summary:
                 summary[status] += 1
         return summary
+
+    def _task_to_payload(self, task: SubAgentTask) -> Dict[str, Any]:
+        return {
+            "name": task.name,
+            "prompt": task.prompt,
+            "depends_on": list(task.depends_on),
+            "write": bool(task.write),
+            "write_paths": list(task.write_paths),
+        }
+
+    def _tasks_from_payload(self, items: Any) -> List[SubAgentTask]:
+        if not isinstance(items, list) or not items:
+            raise ValueError("Checkpoint does not include resumable task definitions.")
+        return self._normalize_subagent_tasks(items)
+
+    def _latest_checkpoint_entries(self, entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for entry in entries:
+            task_name = str(entry.get("task_name") or "").strip()
+            if not task_name:
+                continue
+            latest[task_name] = entry
+        return latest
 
     def _checkpoint_payload(
         self,
@@ -461,6 +533,9 @@ class AgentRuntime:
         entries: List[Dict[str, Any]],
         max_retries: int,
         completed: bool,
+        allow_mutations: bool = False,
+        resumed_from_run_id: str = "",
+        reused_tasks: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         return {
             "run_id": run_id,
@@ -470,6 +545,10 @@ class AgentRuntime:
             "max_retries": max_retries,
             "completed": completed,
             "task_names": [task.name for task in tasks],
+            "tasks": [self._task_to_payload(task) for task in tasks],
+            "allow_mutations": allow_mutations,
+            "resumed_from_run_id": resumed_from_run_id,
+            "reused_tasks": list(reused_tasks or []),
             "summary": self._checkpoint_summary(entries),
             "entries": entries,
         }
@@ -482,8 +561,21 @@ class AgentRuntime:
         entries: List[Dict[str, Any]],
         max_retries: int,
         completed: bool,
+        allow_mutations: bool = False,
+        resumed_from_run_id: str = "",
+        reused_tasks: Optional[List[str]] = None,
     ) -> None:
-        payload = self._checkpoint_payload(run_id, plan_summary, tasks, entries, max_retries, completed)
+        payload = self._checkpoint_payload(
+            run_id,
+            plan_summary,
+            tasks,
+            entries,
+            max_retries,
+            completed,
+            allow_mutations=allow_mutations,
+            resumed_from_run_id=resumed_from_run_id,
+            reused_tasks=reused_tasks,
+        )
         self.last_checkpoint_run_id = run_id
         self.last_checkpoint_path = self.checkpoint_store.save(run_id, payload)
         self.last_task_checkpoints = list(entries)
@@ -507,6 +599,9 @@ class AgentRuntime:
         sandbox: Optional[Dict[str, Any]] = None,
         merge: Optional[Dict[str, Any]] = None,
         completed: bool = False,
+        allow_mutations: bool = False,
+        resumed_from_run_id: str = "",
+        reused_tasks: Optional[List[str]] = None,
     ) -> None:
         entry = {
             "task_name": task_name,
@@ -522,7 +617,17 @@ class AgentRuntime:
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         entries.append(entry)
-        self._persist_checkpoint_run(run_id, plan_summary, tasks, entries, max_retries, completed)
+        self._persist_checkpoint_run(
+            run_id,
+            plan_summary,
+            tasks,
+            entries,
+            max_retries,
+            completed,
+            allow_mutations=allow_mutations,
+            resumed_from_run_id=resumed_from_run_id,
+            reused_tasks=reused_tasks,
+        )
 
     def describe_checkpoints(self, run_id: Optional[str] = None) -> str:
         target_run_id = (run_id or self.last_checkpoint_run_id).strip()
@@ -543,9 +648,14 @@ class AgentRuntime:
                 f"success={summary.get('success', 0)} "
                 f"failed={summary.get('failed', 0)} "
                 f"retrying={summary.get('retrying', 0)} "
-                f"blocked={summary.get('blocked', 0)}"
+                f"blocked={summary.get('blocked', 0)} "
+                f"reused={summary.get('reused', 0)}"
             ),
         ]
+        if payload.get("resumed_from_run_id"):
+            lines.append(f"resumed_from={payload['resumed_from_run_id']}")
+        if payload.get("reused_tasks"):
+            lines.append(f"reused_tasks={', '.join(payload['reused_tasks'])}")
         if payload.get("plan_summary"):
             lines.append(payload["plan_summary"])
         for entry in payload.get("entries", []):
@@ -951,11 +1061,13 @@ class AgentRuntime:
         prefix: str = "sess",
         title: Optional[str] = None,
         approval_policy: Optional[str] = None,
+        visibility: str = "tree",
     ) -> ManagedSession:
         clean_prompt = prompt.strip()
         if not clean_prompt:
             raise ValueError("Session prompt must be non-empty.")
         managed_id = sanitize_session_name(session_id or self._new_managed_session_id(prefix))
+        child_visibility = self._normalize_session_visibility(visibility)
         with self.background_lock:
             if managed_id in self.managed_sessions:
                 raise ValueError(f"Session already exists: {managed_id}")
@@ -967,11 +1079,13 @@ class AgentRuntime:
             approval_policy=child_policy,
             agent_label=f"{self.agent_label}-{managed_id}",
             managed_session_id=managed_id,
+            session_visibility=child_visibility,
         )
         session = ManagedSession(
             session_id=managed_id,
             title=title or self._preview_text(clean_prompt, limit=72),
             parent_id=self.managed_session_id,
+            visibility=child_visibility,
             runtime=child_runtime,
             status="queued",
         )
@@ -990,6 +1104,7 @@ class AgentRuntime:
         if not clean_prompt:
             raise ValueError("Session prompt must be non-empty.")
         with self.background_lock:
+            self._assert_session_access_locked(session_id)
             session = self.managed_sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
@@ -1024,7 +1139,7 @@ class AgentRuntime:
         for session in sessions:
             lines.append(
                 f"{session['session_id']} [{session['status']}] queued={session['queue_depth']} "
-                f"parent={session['parent_id'] or '-'} {session['title']}"
+                f"parent={session['parent_id'] or '-'} visibility={session['visibility']} {session['title']}"
             )
             if session["last_result"]:
                 lines.append(f"  result: {self._preview_text(session['last_result'], limit=180)}")
@@ -1034,7 +1149,7 @@ class AgentRuntime:
 
     def managed_sessions_snapshot(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.background_lock:
-            sessions = list(self.managed_sessions.values())
+            sessions = [session for session in self.managed_sessions.values() if self._can_access_session_locked(session.session_id)]
         if prefix is not None:
             sessions = [session for session in sessions if session.session_id.startswith(prefix)]
         snapshot: List[Dict[str, Any]] = []
@@ -1045,6 +1160,7 @@ class AgentRuntime:
                     "session_id": session.session_id,
                     "title": session.title,
                     "parent_id": session.parent_id,
+                    "visibility": session.visibility,
                     "status": session.status,
                     "created_at": session.created_at,
                     "updated_at": session.updated_at,
@@ -1083,6 +1199,7 @@ class AgentRuntime:
 
     def managed_session_status_payload(self, session_id: str) -> Dict[str, Any]:
         with self.background_lock:
+            self._assert_session_access_locked(session_id)
             session = self.managed_sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
@@ -1091,6 +1208,7 @@ class AgentRuntime:
                 "session_id": session.session_id,
                 "title": session.title,
                 "parent_id": session.parent_id,
+                "visibility": session.visibility,
                 "status": session.status,
                 "created_at": session.created_at,
                 "updated_at": session.updated_at,
@@ -1107,7 +1225,10 @@ class AgentRuntime:
         payload = self.managed_session_status_payload(session_id)
         lines = [
             f"{payload['session_id']} [{payload['status']}] {payload['title']}",
-            f"queued={payload['queue_depth']} items={payload['item_count']} parent={payload['parent_id'] or '-'}",
+            (
+                f"queued={payload['queue_depth']} items={payload['item_count']} "
+                f"parent={payload['parent_id'] or '-'} visibility={payload['visibility']}"
+            ),
         ]
         if payload["latest_message_id"]:
             lines.append(
@@ -1121,6 +1242,7 @@ class AgentRuntime:
 
     def managed_session_history_payload(self, session_id: str, limit: int = 8) -> Dict[str, Any]:
         with self.background_lock:
+            self._assert_session_access_locked(session_id)
             session = self.managed_sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
@@ -1131,6 +1253,7 @@ class AgentRuntime:
             "session_id": session.session_id,
             "title": session.title,
             "parent_id": session.parent_id,
+            "visibility": session.visibility,
             "status": session.status,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
@@ -1160,6 +1283,7 @@ class AgentRuntime:
             "memory_policy": self.settings.memory_policy,
             "workdir": str(self.tools.root),
             "approval_policy": self.settings.approval_policy,
+            "session_visibility": self.session_visibility,
             "max_agents": self.settings.max_agents,
             "task_retries": self.settings.task_retries,
             "session_name": self.session_name,
@@ -1430,6 +1554,10 @@ class AgentRuntime:
         allow_mutations: bool = False,
         max_agents: Optional[int] = None,
         plan_summary: str = "",
+        seed_results: Optional[Dict[str, Dict[str, Any]]] = None,
+        seed_ordered_results: Optional[List[Dict[str, Any]]] = None,
+        seed_task_attempts: Optional[Dict[str, int]] = None,
+        resumed_from_run_id: str = "",
     ) -> ToolResult:
         if not self.enable_subagents:
             return ToolResult(tool="spawn_agents", ok=False, output="Sub-agents are disabled in this runtime.")
@@ -1442,14 +1570,36 @@ class AgentRuntime:
             return ToolResult(tool="spawn_agents", ok=False, output="max_agents must be >= 1")
         retry_limit = max(0, int(self.settings.task_retries))
         worker_count = min(worker_limit, self.settings.max_agents, len(tasks))
-        pending = {task.name: task for task in tasks}
-        results: Dict[str, Dict[str, Any]] = {}
-        ordered_results: List[Dict[str, Any]] = []
+        results: Dict[str, Dict[str, Any]] = dict(seed_results or {})
+        ordered_results: List[Dict[str, Any]] = list(seed_ordered_results or [])
+        pending = {task.name: task for task in tasks if task.name not in results}
         checkpoint_entries: List[Dict[str, Any]] = []
         task_attempts = {task.name: 0 for task in tasks}
+        if seed_task_attempts:
+            task_attempts.update({name: int(value) for name, value in seed_task_attempts.items() if name in task_attempts})
         subagent_index = 0
         self.last_merge_report = None
         checkpoint_run_id = self.checkpoint_store.new_run_id(prefix=f"{self.session_name}-dag")
+        reused_tasks = [item["name"] for item in ordered_results if item.get("status") == "reused"]
+        for item in ordered_results:
+            self._record_task_checkpoint(
+                run_id=checkpoint_run_id,
+                plan_summary=plan_summary,
+                tasks=tasks,
+                entries=checkpoint_entries,
+                max_retries=retry_limit,
+                task_name=item["name"],
+                attempt=int(item.get("attempts", 0)),
+                status="reused",
+                ok=bool(item.get("ok", True)),
+                final=str(item.get("final") or ""),
+                sandbox=item.get("sandbox"),
+                merge=item.get("merge"),
+                completed=False,
+                allow_mutations=allow_mutations,
+                resumed_from_run_id=resumed_from_run_id,
+                reused_tasks=reused_tasks,
+            )
         self._persist_checkpoint_run(
             checkpoint_run_id,
             plan_summary,
@@ -1457,6 +1607,9 @@ class AgentRuntime:
             checkpoint_entries,
             retry_limit,
             completed=False,
+            allow_mutations=allow_mutations,
+            resumed_from_run_id=resumed_from_run_id,
+            reused_tasks=reused_tasks,
         )
 
         while pending:
@@ -1491,6 +1644,9 @@ class AgentRuntime:
                     final=item["final"],
                     blocked_by=failed_deps,
                     completed=False,
+                    allow_mutations=allow_mutations,
+                    resumed_from_run_id=resumed_from_run_id,
+                    reused_tasks=reused_tasks,
                 )
             if not pending:
                 break
@@ -1508,6 +1664,9 @@ class AgentRuntime:
                     checkpoint_entries,
                     retry_limit,
                     completed=False,
+                    allow_mutations=allow_mutations,
+                    resumed_from_run_id=resumed_from_run_id,
+                    reused_tasks=reused_tasks,
                 )
                 return ToolResult(
                     tool="spawn_agents",
@@ -1562,6 +1721,9 @@ class AgentRuntime:
                             sandbox=item.get("sandbox"),
                             merge=item.get("merge"),
                             completed=False,
+                            allow_mutations=allow_mutations,
+                            resumed_from_run_id=resumed_from_run_id,
+                            reused_tasks=reused_tasks,
                         )
                         continue
 
@@ -1583,6 +1745,9 @@ class AgentRuntime:
                             sandbox=item.get("sandbox"),
                             merge=item.get("merge"),
                             completed=False,
+                            allow_mutations=allow_mutations,
+                            resumed_from_run_id=resumed_from_run_id,
+                            reused_tasks=reused_tasks,
                         )
                         continue
 
@@ -1605,11 +1770,19 @@ class AgentRuntime:
                         sandbox=item.get("sandbox"),
                         merge=item.get("merge"),
                         completed=False,
+                        allow_mutations=allow_mutations,
+                        resumed_from_run_id=resumed_from_run_id,
+                        reused_tasks=reused_tasks,
                     )
 
         lines = []
         if plan_summary:
             lines.append(plan_summary)
+            lines.append("")
+        if resumed_from_run_id:
+            lines.append(f"Resumed from checkpoint: {resumed_from_run_id}")
+            if reused_tasks:
+                lines.append(f"Reused tasks: {', '.join(reused_tasks)}")
             lines.append("")
         lines.append(f"Executed {len(tasks)} planned tasks with parallelism={worker_count}.")
         lines.append(f"Mutation mode: {'enabled' if allow_mutations else 'disabled'}")
@@ -1633,6 +1806,9 @@ class AgentRuntime:
             checkpoint_entries,
             retry_limit,
             completed=True,
+            allow_mutations=allow_mutations,
+            resumed_from_run_id=resumed_from_run_id,
+            reused_tasks=reused_tasks,
         )
         metadata = {
             "results": ordered_results,
@@ -1640,6 +1816,8 @@ class AgentRuntime:
             "checkpoint_run_id": checkpoint_run_id,
             "checkpoint_path": str(self.last_checkpoint_path) if self.last_checkpoint_path else "",
             "checkpoints": checkpoint_entries,
+            "resumed_from_run_id": resumed_from_run_id,
+            "reused_tasks": reused_tasks,
         }
         if merge_report:
             metadata["merge_report"] = merge_report
@@ -1668,6 +1846,75 @@ class AgentRuntime:
                 output="Parallel agents may mutate the workspace only when approval policy is 'auto'.",
             )
         return self.execute_task_graph(normalized, allow_mutations=allow_mutations, max_agents=max_agents)
+
+    def resume_from_checkpoint(self, run_id: str, max_agents: Optional[int] = None) -> ToolResult:
+        try:
+            payload = self.checkpoint_store.load(run_id)
+        except FileNotFoundError as exc:
+            return ToolResult(tool="resume_checkpoint", ok=False, output=str(exc))
+        try:
+            tasks = self._tasks_from_payload(payload.get("tasks"))
+        except ValueError as exc:
+            return ToolResult(
+                tool="resume_checkpoint",
+                ok=False,
+                output=(
+                    f"{exc} Only checkpoints created after resumable task metadata was introduced can be resumed."
+                ),
+            )
+
+        latest = self._latest_checkpoint_entries(payload.get("entries") or [])
+        allow_mutations = bool(payload.get("allow_mutations", False))
+        if allow_mutations and self.settings.approval_policy != "auto":
+            return ToolResult(
+                tool="resume_checkpoint",
+                ok=False,
+                output="Resuming a mutating checkpoint requires approval policy 'auto'.",
+            )
+        seed_results: Dict[str, Dict[str, Any]] = {}
+        seed_ordered_results: List[Dict[str, Any]] = []
+        seed_task_attempts: Dict[str, int] = {}
+        pending_names: List[str] = []
+
+        for task in tasks:
+            entry = latest.get(task.name)
+            if entry is not None:
+                seed_task_attempts[task.name] = int(entry.get("attempt") or 0)
+            if entry and bool(entry.get("ok")) and str(entry.get("status") or "") in {"success", "reused"}:
+                item = {
+                    "name": task.name,
+                    "ok": True,
+                    "final": str(entry.get("final") or ""),
+                    "mutations": [],
+                    "attempts": int(entry.get("attempt") or 0),
+                    "status": "reused",
+                    "sandbox": entry.get("sandbox") or {},
+                    "merge": entry.get("merge") or {},
+                }
+                seed_results[task.name] = item
+                seed_ordered_results.append(item)
+            else:
+                pending_names.append(task.name)
+
+        if not pending_names:
+            return ToolResult(
+                tool="resume_checkpoint",
+                ok=True,
+                output=f"Checkpoint {run_id} is already complete. Nothing to resume.",
+                metadata={"resumed_from_run_id": run_id, "reused_tasks": [item['name'] for item in seed_ordered_results]},
+            )
+
+        plan_summary = str(payload.get("plan_summary") or "Resumed task graph").strip()
+        return self.execute_task_graph(
+            tasks,
+            allow_mutations=allow_mutations,
+            max_agents=max_agents,
+            plan_summary=plan_summary,
+            seed_results=seed_results,
+            seed_ordered_results=seed_ordered_results,
+            seed_task_attempts=seed_task_attempts,
+            resumed_from_run_id=run_id,
+        )
 
     def orchestrate_goal(
         self,
@@ -1705,6 +1952,7 @@ class AgentRuntime:
             prompt,
             prefix="bg",
             approval_policy="auto" if self.settings.approval_policy == "auto" else "deny",
+            visibility="tree",
         )
         return self._managed_to_background_task(session)
 
@@ -1741,6 +1989,7 @@ class AgentRuntime:
                     session_id=args.get("session_id"),
                     write=allow_mutations,
                     title=str(args.get("title") or "").strip(),
+                    visibility=str(args.get("visibility") or "tree").strip() or "tree",
                 )
             except ValueError as exc:
                 return ToolResult(tool="sessions_spawn", ok=False, output=str(exc))
@@ -1828,6 +2077,11 @@ class AgentRuntime:
                 max_tasks=args.get("max_tasks"),
                 max_agents=args.get("max_agents"),
             )
+        if tool_name == "resume_checkpoint":
+            run_id = str(args.get("run_id") or "").strip()
+            if not run_id:
+                return ToolResult(tool="resume_checkpoint", ok=False, output="'run_id' is required.")
+            return self.resume_from_checkpoint(run_id, max_agents=args.get("max_agents"))
         return self.tools.run(tool_name, args)
 
     def run_task(self, text: str) -> str:
@@ -1934,7 +2188,12 @@ class AgentRuntime:
     def knowledge_status(self) -> str:
         return render_knowledge_status(self.tools.root)
 
+    def ingest_knowledge_sources(self) -> str:
+        payload = ingest_sources(self.tools.root)
+        return render_ingest_summary(self.tools.root, payload)
+
     def run_knowledge_compile(self, scope: str = "") -> str:
+        ingest_sources(self.tools.root)
         return self.run_task(build_compile_prompt(self.tools.root, scope=scope))
 
     def run_knowledge_ask(self, question: str, output_path: str = "", output_format: str = "markdown") -> str:
@@ -1972,6 +2231,7 @@ class AgentRuntime:
                     "/delegate <goal>",
                     "/session-spawn <goal>",
                     "/session-send <session_id> <goal>",
+                    "/session-visibility [self|tree|all]",
                     "/session-status <session_id>",
                     "/session-history <session_id> [limit]",
                     "/background <goal>",
@@ -1980,6 +2240,7 @@ class AgentRuntime:
                     "/locks",
                     "/merge",
                     "/checkpoints [run_id]",
+                    "/resume-checkpoint <run_id>",
                     "/history [limit]",
                     "/compact [limit]",
                     "/init",
@@ -1987,6 +2248,7 @@ class AgentRuntime:
                     "/memories [query]",
                     "/kb-init [name]",
                     "/kb-status",
+                    "/kb-ingest",
                     "/kb-compile [scope]",
                     "/kb-ask <question>",
                     "/kb-slide <question>",
@@ -2127,6 +2389,13 @@ class AgentRuntime:
             item = self.send_managed_session_input(args[0], " ".join(args[1:]))
             self.ui.assistant(f"queued {item.message_id} for {args[0]}")
             return None
+        if command == "/session-visibility":
+            if not args:
+                self.ui.assistant(self.session_visibility)
+                return None
+            self.set_session_visibility(args[0])
+            self.ui.assistant(f"session_visibility={self.session_visibility}")
+            return None
         if command == "/session-status":
             if not args:
                 raise ValueError("Usage: /session-status <session_id>")
@@ -2169,6 +2438,12 @@ class AgentRuntime:
             run_id = args[0] if args else None
             self.ui.assistant(self.describe_checkpoints(run_id))
             return None
+        if command == "/resume-checkpoint":
+            if not args:
+                raise ValueError("Usage: /resume-checkpoint <run_id>")
+            result = self.resume_from_checkpoint(args[0], max_agents=self.settings.max_agents)
+            self.ui.tool(result)
+            return None
         if command == "/history":
             limit = int(args[0]) if args else 8
             history = self.recent_history(limit)
@@ -2199,6 +2474,9 @@ class AgentRuntime:
             return None
         if command == "/kb-status":
             self.ui.assistant(self.knowledge_status())
+            return None
+        if command == "/kb-ingest":
+            self.ui.assistant(self.ingest_knowledge_sources())
             return None
         if command == "/kb-compile":
             scope = line[len("/kb-compile") :].strip()
