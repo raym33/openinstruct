@@ -1,0 +1,151 @@
+{
+  "name": "openinstruct-local",
+  "displayName": "OpenInstruct Local",
+  "description": "Agentes de código locales para Code - OSS/VS Code usando OpenInstruct, Ollama y LM Studio.",
+  "version": "0.1.0",
+  "publisher": "openinstruct",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:openinstruct.startDaemon",
+    "onCommand:openinstruct.stopDaemon",
+    "onCommand:openinstruct.openChat",
+    "onView:openinstruct.sessions"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "openinstruct.startDaemon",
+        "title": "OpenInstruct: Start Daemon"
+      },
+      {
+        "command": "openinstruct.stopDaemon",
+        "title": "OpenInstruct: Stop Daemon"
+      },
+      {
+        "command": "openinstruct.openChat",
+        "title": "OpenInstruct: Open Chat"
+      },
+      {
+        "command": "openinstruct.refreshSessions",
+        "title": "OpenInstruct: Refresh Sessions"
+      },
+      {
+        "command": "openinstruct.showSessionHistory",
+        "title": "OpenInstruct: Show Session History"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "openinstruct",
+          "title": "OpenInstruct",
+          "icon": "media/openinstruct.svg"
+        }
+      ]
+    },
+    "views": {
+      "openinstruct": [
+        {
+          "id": "openinstruct.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenInstruct",
+      "properties": {
+        "openinstruct.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Arranca openinstructd automáticamente al abrir un workspace."
+        },
+        "openinstruct.server.command": {
+          "type": "string",
+          "default": "openinstructd",
+          "description": "Comando usado para arrancar openinstructd."
+        },
+        "openinstruct.server.args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Argumentos extra para openinstructd."
+        },
+        "openinstruct.server.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host local del daemon."
+        },
+        "openinstruct.server.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Puerto HTTP del daemon."
+        },
+        "openinstruct.provider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ollama",
+            "lmstudio"
+          ],
+          "default": "auto",
+          "description": "Proveedor LLM preferido."
+        },
+        "openinstruct.model": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo por defecto para el daemon."
+        },
+        "openinstruct.approvalPolicy": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto",
+            "deny"
+          ],
+          "default": "ask",
+          "description": "Política de aprobación del runtime."
+        },
+        "openinstruct.memoryBackend": {
+          "type": "string",
+          "enum": [
+            "none",
+            "mem0",
+            "sqlite"
+          ],
+          "default": "none",
+          "description": "Backend de memoria persistente."
+        },
+        "openinstruct.memoryPolicy": {
+          "type": "string",
+          "enum": [
+            "none",
+            "selective",
+            "all"
+          ],
+          "default": "selective",
+          "description": "Política de persistencia de recuerdos."
+        },
+        "openinstruct.maxAgents": {
+          "type": "number",
+          "default": 3,
+          "description": "Número máximo de subagentes."
+        },
+        "openinstruct.taskRetries": {
+          "type": "number",
+          "default": 1,
+          "description": "Reintentos por tarea del DAG."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openinstruct"
+version = "0.1.0"
+description = "CLI local para agentes LLM con Ollama o LM Studio"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+mem0 = ["mem0ai"]
+
+[project.scripts]
+openinstruct = "openinstruct.cli:main"
+openinstructd = "openinstruct.daemon:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openinstruct*"]
